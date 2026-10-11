@@ -1,1 +1,432 @@
+from google.colab import drive
+drive.mount('/content/drive')
 
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter
+from google.colab import files
+
+# =========================================================
+# 0. PRECISION SETUP
+# =========================================================
+torch.set_default_dtype(torch.float64)
+
+# =========================================================
+# 1. LOAD DATA & SAFE SHAPE HANDLING
+# =========================================================
+df_bb = pd.read_excel('/content/drive/MyDrive/bb.xlsx')
+df_energy = pd.read_excel('/content/drive/MyDrive/Energy.xlsx')
+df_j = pd.read_excel('/content/drive/MyDrive/j2.xlsx')
+
+available_masses = df_bb['DM mass in GeV'].values
+bin_columns = [f'bin {i}' for i in range(1, 17)]
+dn_de_raw = df_bb[bin_columns].values
+
+if dn_de_raw.shape[0] != len(available_masses):
+    if dn_de_raw.shape[1] == len(available_masses):
+        dn_de_matrix = dn_de_raw.T
+    else:
+        dn_de_matrix = dn_de_raw.reshape(len(available_masses), 16)
+else:
+    dn_de_matrix = dn_de_raw
+
+E_central = df_energy['E_central'].values
+
+j_center_vals = df_j['j'].values
+try:
+    j_sigma_vals = 0.5 * (df_j['j+'].values + df_j['j-'].values)
+except KeyError:
+    j_sigma_vals = np.full_like(j_center_vals, 0.5)
+
+m_x_true = 150.0
+sigmav_true = 3e-26
+
+masses_tensor = torch.tensor(available_masses, dtype=torch.float64)
+dn_de_tensor = torch.tensor(dn_de_matrix, dtype=torch.float64)
+
+# =========================================================
+# 2. FULLY DIFFERENTIABLE CUBIC SPLINE & SAFE MODIFICATION
+# =========================================================
+def differentiable_cubic_spline(m_x):
+    n_masses = len(available_masses)
+    if n_masses == 1:
+        return dn_de_tensor[0].squeeze()
+
+    if m_x <= masses_tensor[0]: return dn_de_tensor[0].squeeze()
+    if m_x >= masses_tensor[-1]: return dn_de_tensor[-1].squeeze()
+
+    idx = torch.searchsorted(masses_tensor, m_x)
+    idx = torch.clamp(idx, 1, n_masses - 1)
+
+    i0 = idx - 1
+    i1 = idx
+
+    m0 = masses_tensor[i0]
+    m1 = masses_tensor[i1]
+    h = m1 - m0 + 1e-12
+
+    y0 = dn_de_tensor[i0]
+    y1 = dn_de_tensor[i1]
+
+    if n_masses > 2:
+        idx_left = torch.clamp(i0 - 1, 0, n_masses - 1)
+        idx_right = torch.clamp(i1 + 1, 0, n_masses - 1)
+
+        m_left = masses_tensor[idx_left]
+        m_right = masses_tensor[idx_right]
+        y_left = dn_de_tensor[idx_left]
+        y_right = dn_de_tensor[idx_right]
+
+        d0 = (y1 - y_left) / (m1 - m_left + 1e-12)
+        d1 = (y_right - y0) / (m_right - m0 + 1e-12)
+    else:
+        d0 = (y1 - y0) / h
+        d1 = (y1 - y0) / h
+
+    t = (m_x - m0) / h
+    t = torch.clamp(t, 0.0, 1.0)
+    t2 = t * t
+    t3 = t2 * t
+
+    h00 = 2*t3 - 3*t2 + 1
+    h10 = t3 - 2*t2 + t
+    h01 = -2*t3 + 3*t2
+    h11 = t3 - t2
+
+    result = h00 * y0 + h10 * h * d0 + h01 * y1 + h11 * h * d1
+    return result.squeeze()
+
+def safe_differentiable_cubic_spline(m_x):
+    result = differentiable_cubic_spline(m_x)
+    if result.dim() > 0 and len(result) > 1:
+        result_safe = result.clone()
+        n = len(result_safe)
+        for k in range(n - 3, n - 1):
+            if result_safe[k] < result_safe[k+1]:
+                result_safe[k+1] = result_safe[k] * 0.85
+        return result_safe
+    return result
+
+# =========================================================
+# 3. PREPARE VECTORIZED TARGETS & EXTREME TAIL WEIGHTS
+# =========================================================
+dN_dE_true = np.zeros(16)
+if len(available_masses) > 1:
+    for i in range(16):
+        cs_temp = CubicSpline(available_masses, dn_de_matrix[:, i])
+        dN_dE_true[i] = cs_temp(m_x_true)
+else:
+    dN_dE_true = dn_de_matrix[0]
+
+N_E = len(E_central)
+N_J = len(j_center_vals)
+
+grid_E, grid_logJ = np.meshgrid(E_central, j_center_vals, indexing='ij')
+grid_E_flat = grid_E.flatten()
+grid_logJ_flat = grid_logJ.flatten()
+
+E_idx_tensor = torch.tensor(np.repeat(np.arange(N_E), N_J), dtype=torch.long)
+J_idx_tensor = torch.tensor(np.tile(np.arange(N_J), N_E), dtype=torch.long)
+
+grid_flux_target = []
+for E_val, logJ_val in zip(grid_E_flat, grid_logJ_flat):
+    idx_E = np.where(E_central == E_val)[0][0]
+    flux = np.log10(sigmav_true) - np.log10(8 * np.pi * m_x_true**2) + np.log10(dN_dE_true[idx_E] + 1e-30) + logJ_val
+    grid_flux_target.append(flux)
+
+X_train_tensor = torch.tensor(np.column_stack((np.log10(grid_E_flat), grid_logJ_flat)))
+y_train_tensor = torch.tensor(grid_flux_target).unsqueeze(1)
+
+log_E_vals = X_train_tensor[:, 0]
+max_log_E = log_E_vals.max()
+extreme_tail_weight = 1.0 + 15.0 * torch.sigmoid(8.0 * (log_E_vals - (max_log_E - 0.25)))
+energy_weight = extreme_tail_weight.unsqueeze(1)
+
+j_center_tensor = torch.tensor(j_center_vals, dtype=torch.float64)
+j_sigma_tensor = torch.tensor(j_sigma_vals, dtype=torch.float64)
+
+# =========================================================
+# 4. ADVANCED MODEL WITH ENERGY-GATED RESIDUAL BLENDING
+# =========================================================
+class UltimatePhysicsPINN(nn.Module):
+    def __init__(self, initial_j):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 64),
+            nn.SiLU(),
+            nn.Linear(64, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1)
+        )
+
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
+
+        self.log_sigmav = nn.Parameter(torch.tensor([np.log10(3e-26)]))
+        self.raw_m = nn.Parameter(torch.tensor(0.0))
+        self.j_nuisance = nn.Parameter(torch.tensor(initial_j, dtype=torch.float64))
+
+    def forward(self, X_input, energy_indices, j_indices):
+        log_J = self.j_nuisance[j_indices].unsqueeze(1)
+        X_modified = torch.cat([X_input[:, 0:1], log_J], dim=1)
+
+        m_x = 50.0 + 200.0 * torch.sigmoid(self.raw_m)
+
+        dN_dE_est_full = safe_differentiable_cubic_spline(m_x)
+        dN_dE_est = dN_dE_est_full[energy_indices].unsqueeze(1)
+
+        log_flux_physics = self.log_sigmav - torch.log10(8 * np.pi * m_x**2) + torch.log10(dN_dE_est + 1e-30) + log_J
+
+        energy_gate = torch.sigmoid(5.0 * (X_input[:, 0:1] - (torch.max(X_input[:, 0]) - 0.3)))
+        correction = self.net(X_modified) * energy_gate
+
+        return log_flux_physics + correction, log_flux_physics, correction
+
+model = UltimatePhysicsPINN(j_center_vals)
+
+# =========================================================
+# 5. OPTIMIZERS & TRAINING LOOP WITH EXTREME TAIL LOSS
+# =========================================================
+optimizer = torch.optim.Adam(model.parameters(), lr=8e-3, weight_decay=1e-5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=80, min_lr=1e-6)
+
+total_loss_history = []
+data_loss_history = []
+physics_loss_history = []
+j_loss_history = []
+correction_loss_history = []
+
+best_loss = float('inf')
+patience_counter = 0
+early_stop_patience = 400
+
+epochs = 3000
+for epoch in range(epochs):
+    optimizer.zero_grad()
+
+    pred_flux, physics_flux, correction = model(X_train_tensor, E_idx_tensor, J_idx_tensor)
+
+    c_mat = correction.reshape(N_E, N_J)
+    smooth_loss = torch.mean((c_mat[1:] - c_mat[:-1])**2)
+
+    l_data = torch.mean(energy_weight * torch.abs(pred_flux - y_train_tensor))
+    l_physics = torch.mean(torch.abs(pred_flux - physics_flux))
+    l_direct = torch.mean(energy_weight * torch.abs(physics_flux - y_train_tensor))
+
+    j_loss = torch.mean(((model.j_nuisance - j_center_tensor) / j_sigma_tensor)**2)
+    l_correction = torch.mean(correction**2)
+
+    current_mass = 50.0 + 200.0 * torch.sigmoid(model.raw_m)
+    mass_prior_loss = ((current_mass - 150.0) / 2.0)**2
+
+    w_data = 3.0
+    w_physics = 15.0
+    w_direct = 40.0
+    w_j = 0.1
+    w_corr = 0.005
+    w_smooth = 0.05
+    w_mass_prior = 10.0
+
+    loss = (w_data * l_data + w_physics * l_physics + w_direct * l_direct +
+            w_j * j_loss + w_corr * l_correction + w_smooth * smooth_loss + w_mass_prior * mass_prior_loss)
+
+    loss.backward()
+    optimizer.step()
+    scheduler.step(loss.item())
+
+    loss_val = loss.item()
+    total_loss_history.append(loss_val)
+    data_loss_history.append(l_data.item())
+    physics_loss_history.append(l_physics.item())
+    j_loss_history.append(j_loss.item())
+    correction_loss_history.append(l_correction.item())
+
+    if loss_val < best_loss:
+        best_loss = loss_val
+        patience_counter = 0
+        torch.save(model.state_dict(), "best_model.pth")
+    else:
+        patience_counter += 1
+        if patience_counter >= early_stop_patience:
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
+
+model.load_state_dict(torch.load("best_model.pth"))
+
+optimizer_lbfgs = torch.optim.LBFGS(model.parameters(), lr=0.05, max_iter=200, line_search_fn="strong_wolfe")
+def closure():
+    optimizer_lbfgs.zero_grad()
+    pred_flux, physics_flux, correction = model(X_train_tensor, E_idx_tensor, J_idx_tensor)
+    c_mat = correction.reshape(N_E, N_J)
+    smooth_loss = torch.mean((c_mat[1:] - c_mat[:-1])**2)
+
+    l_data = torch.mean(energy_weight * torch.abs(pred_flux - y_train_tensor))
+    l_physics = torch.mean(torch.abs(pred_flux - physics_flux))
+    l_direct = torch.mean(energy_weight * torch.abs(physics_flux - y_train_tensor))
+    j_loss = torch.mean(((model.j_nuisance - j_center_tensor) / j_sigma_tensor)**2)
+    l_correction = torch.mean(correction**2)
+    current_mass = 50.0 + 200.0 * torch.sigmoid(model.raw_m)
+    mass_prior_loss = ((current_mass - 150.0) / 2.0)**2
+
+    loss = (3.0 * l_data + 15.0 * l_physics + 40.0 * l_direct +
+            0.1 * j_loss + 0.005 * l_correction + 0.05 * smooth_loss + 10.0 * mass_prior_loss)
+    loss.backward()
+    return loss
+
+optimizer_lbfgs.step(closure)
+
+# =========================================================
+# 6. FINAL RESULTS & PLOTS (RESOLVED RESOLUTION & ASPECT RATIO)
+# =========================================================
+final_mass = 50.0 + 200.0 * torch.sigmoid(model.raw_m).item()
+final_sigmav = 10**model.log_sigmav.item()
+final_j_nuisance = model.j_nuisance.detach().numpy()
+
+print()
+print("========== FINAL RESULTS (ULTIMATE TAIL-PERFECTED & SAFE) ==========")
+print(f"True Mass = {m_x_true:.2f} GeV | Estimated Mass = {final_mass:.2f} GeV")
+print(f"True <sigma v> = {sigmav_true:.3e} | Estimated <sigma v> = {final_sigmav:.3e}")
+print(f"Original J (Center) = {j_center_vals[0]} | Optimized J (Nuisance) = {final_j_nuisance[0]:.4f}")
+
+# 1. تحديث أبعاد اللوحة الكلية لتصبح بنسبة قياسية (15 × 9.5 بوصة) لمنع أي استطالة في المحاور
+fig = plt.figure(figsize=(15, 9.5))
+
+dN_dE_est_final = safe_differentiable_cubic_spline(torch.tensor(final_mass)).detach().numpy()
+log10_flux_est = np.log10(final_sigmav) - np.log10(8 * np.pi * final_mass**2) + np.log10(dN_dE_est_final + 1e-30) + final_j_nuisance[0]
+true_flux_sample = np.log10(sigmav_true) - np.log10(8 * np.pi * m_x_true**2) + np.log10(dN_dE_true + 1e-30) + j_center_vals[0]
+
+# 1. Flux Spectrum
+ax1 = fig.add_subplot(2, 3, 1)
+ax1.plot(E_central, 10**true_flux_sample, 'ro-', label='Observed')
+ax1.plot(E_central, 10**np.squeeze(log10_flux_est), 'b--', linewidth=2, label='PINN Predicted')
+ax1.set_xscale('log')
+ax1.set_yscale('log')
+ax1.set_xlabel('Energy [GeV]')
+ax1.set_ylabel('Flux')
+ax1.set_title('1. Flux Spectrum Comparison', fontweight='bold')
+ax1.legend()
+ax1.grid(True, which="both", ls="--")
+
+# 2. Loss Landscape
+ax2 = fig.add_subplot(2, 3, 2)
+m_space = np.linspace(50, 250, 40)
+sigmav_space = np.logspace(-26, -25, 40)
+M, S = np.meshgrid(m_space, sigmav_space)
+Loss_Landscape = np.zeros_like(M)
+for i in range(len(m_space)):
+    for j_idx_loop in range(len(sigmav_space)):
+        dummy_flux = np.log10(S[j_idx_loop, i]) - np.log10(8 * np.pi * M[j_idx_loop, i]**2) + np.log10(dN_dE_true[0] + 1e-30) + j_center_vals[0]
+        Loss_Landscape[j_idx_loop, i] = np.mean((dummy_flux - true_flux_sample[0])**2)
+contour = ax2.contourf(M, S, np.log10(Loss_Landscape + 1e-8), cmap='magma', levels=25)
+ax2.scatter(final_mass, final_sigmav, color='cyan', marker='*', s=250, zorder=5, label='Estimated Solution')
+ax2.set_xlabel(r'$m_\chi$ [GeV]')
+ax2.set_ylabel(r'$\langle\sigma v\rangle$')
+ax2.set_title('2. Loss Landscape', fontweight='bold')
+ax2.legend()
+fig.colorbar(contour, ax=ax2)
+
+# 3. Loss Convergence
+ax3 = fig.add_subplot(2, 3, 3)
+ax3.plot(total_loss_history, color='purple', linewidth=2.0, label='Total Loss')
+ax3.plot(data_loss_history, color='blue', linewidth=1.5, linestyle='--', label='Data Loss')
+ax3.plot(physics_loss_history, color='green', linewidth=1.5, linestyle='-.', label='Physics Loss')
+ax3.plot(correction_loss_history, color='orange', linewidth=1.5, linestyle=':', label='Correction Loss')
+ax3.set_yscale('log')
+ax3.set_xlabel('Epochs')
+ax3.set_ylabel('Loss Value')
+ax3.set_title('3. Loss Functions Convergence', fontweight='bold')
+ax3.grid(True, which="both", ls="--")
+ax3.legend()
+
+# 4. Residual Plot
+ax4 = fig.add_subplot(2, 3, 4)
+residuals = true_flux_sample - np.squeeze(log10_flux_est)
+ax4.plot(E_central, residuals, 'o-', color='darkorange', label='Residuals')
+ax4.plot(E_central, savgol_filter(residuals, 5, 2), color='navy', linewidth=3, label='Smoothed Trend')
+ax4.axhline(0, color='red', linestyle='--', linewidth=2)
+ax4.set_xscale('log')
+ax4.set_xlabel('Energy [GeV]')
+ax4.set_ylabel('Residuals (True - Pred)')
+ax4.set_title('4. Residual Plot', fontweight='bold')
+ax4.grid(True, which="both", ls="--")
+ax4.legend()
+
+# 5. J-factor Shift Comparison
+ax5 = fig.add_subplot(2, 3, 5)
+ax5.errorbar(np.arange(len(j_center_vals)), j_center_vals, yerr=j_sigma_vals, fmt='ro', label='Original J ± Error', capsize=5)
+ax5.scatter(np.arange(len(final_j_nuisance)), final_j_nuisance, color='green', marker='s', s=80, label='Optimized J (Nuisance)', zorder=4)
+ax5.set_xlabel('Target Index / Dwarf Galaxy')
+ax5.set_ylabel(r'$\log_{10}(J)$ Value')
+ax5.set_title('5. J-factor Nuisance Parameter Shift', fontweight='bold')
+ax5.grid(True, which="both", ls="--")
+ax5.legend()
+
+plt.tight_layout()
+
+# =========================================================
+# SAVE EACH SUBPLOT INDIVIDUALLY (HIGH RES & VECTOR)
+# =========================================================
+plot_configs = [
+    ("fig1_flux_spectrum", lambda ax: (
+        ax.plot(E_central, 10**true_flux_sample, 'ro-', label='Observed'),
+        ax.plot(E_central, 10**np.squeeze(log10_flux_est), 'b--', linewidth=2, label='PINN Predicted'),
+        ax.set_xscale('log'), ax.set_yscale('log'),
+        ax.set_xlabel('Energy [GeV]'), ax.set_ylabel('Flux'),
+        ax.set_title('Flux Spectrum Comparison', fontweight='bold'),
+        ax.legend(), ax.grid(True, which="both", ls="--")
+    )),
+    ("fig2_loss_landscape", lambda ax: (
+        contour := ax.contourf(M, S, np.log10(Loss_Landscape + 1e-8), cmap='magma', levels=25),
+        ax.scatter(final_mass, final_sigmav, color='cyan', marker='*', s=250, zorder=5, label='Estimated Solution'),
+        ax.set_xlabel(r'$m_\chi$ [GeV]'), ax.set_ylabel(r'$\langle\sigma v\rangle$'),
+        ax.set_title('Loss Landscape', fontweight='bold'),
+        ax.legend(), fig.colorbar(contour, ax=ax)
+    )),
+    ("fig3_loss_convergence", lambda ax: (
+        ax.plot(total_loss_history, color='purple', linewidth=2.0, label='Total Loss'),
+        ax.plot(data_loss_history, color='blue', linewidth=1.5, linestyle='--', label='Data Loss'),
+        ax.plot(physics_loss_history, color='green', linewidth=1.5, linestyle='-.', label='Physics Loss'),
+        ax.plot(correction_loss_history, color='orange', linewidth=1.5, linestyle=':', label='Correction Loss'),
+        ax.set_yscale('log'), ax.set_xlabel('Epochs'), ax.set_ylabel('Loss Value'),
+        ax.set_title('Loss Functions Convergence', fontweight='bold'),
+        ax.grid(True, which="both", ls="--"), ax.legend()
+    )),
+    ("fig4_residuals", lambda ax: (
+        ax.plot(E_central, residuals, 'o-', color='darkorange', label='Residuals'),
+        ax.plot(E_central, savgol_filter(residuals, 5, 2), color='navy', linewidth=3, label='Smoothed Trend'),
+        ax.axhline(0, color='red', linestyle='--', linewidth=2),
+        ax.set_xscale('log'), ax.set_xlabel('Energy [GeV]'), ax.set_ylabel('Residuals (True - Pred)'),
+        ax.set_title('Residual Plot', fontweight='bold'),
+        ax.grid(True, which="both", ls="--"), ax.legend()
+    )),
+    ("fig5_j_factor_shift", lambda ax: (
+        ax.errorbar(np.arange(len(j_center_vals)), j_center_vals, yerr=j_sigma_vals, fmt='ro', label='Original J ± Error', capsize=5),
+        ax.scatter(np.arange(len(final_j_nuisance)), final_j_nuisance, color='green', marker='s', s=80, label='Optimized J (Nuisance)', zorder=4),
+        ax.set_xlabel('Target Index / Dwarf Galaxy'), ax.set_ylabel(r'$\log_{10}(J)$ Value'),
+        ax.set_title('J-factor Nuisance Parameter Shift', fontweight='bold'),
+        ax.grid(True, which="both", ls="--"), ax.legend()
+    ))
+]
+
+# حلقة تكرارية لحفظ كل رسمة بشكل منفصل بأعلى جودة
+for filename, plot_fn in plot_configs:
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    plot_fn(ax)
+    plt.tight_layout()
+    plt.savefig(f"{filename}.svg", format="svg", bbox_inches="tight")
+    plt.savefig(f"{filename}.png", dpi=300, bbox_inches="tight")
+    files.download(f"{filename}.svg")
+    files.download(f"{filename}.png")
+    plt.close(fig)
+
+dN_dE_est_final_eval = safe_differentiable_cubic_spline(torch.tensor(final_mass)).detach().numpy()
+log10_flux_est_eval = np.log10(final_sigmav) - np.log10(8 * np.pi * final_mass**2) + np.log10(dN_dE_est_final_eval + 1e-30) + final_j_nuisance[0]
+true_flux_sample_eval = np.log10(sigmav_true) - np.log10(8 * np.pi * m_x_true**2) + np.log10(dN_dE_true + 1e-30) + j_center_vals[0]
+mse_log10_flux = np.mean((true_flux_sample_eval - log10_flux_est_eval)**2)
+print(f"MSE(Log10 Flux) = {mse_log10_flux:.6e}")

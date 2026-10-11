@@ -1,4 +1,4 @@
-# PINN Model for Dark Matter 
+# PINN Model for Dark Matter Detection
 
 A research-grade Physics-Informed Neural Network (PINN) model implemented in PyTorch to dark matter parameter estimation.
 
